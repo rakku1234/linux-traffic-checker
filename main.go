@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"io"
 	"log/slog"
+	"math/big"
 	"net/http"
 	"os"
 	"strconv"
@@ -15,6 +16,7 @@ import (
 )
 
 type Config struct {
+	TimeZone   string `json:"timezone"`
 	Interface  string `json:"interface"`
 	StatsFile  string `json:"stats_file"`
 	WebhookURL string `json:"discord_webhook_url"`
@@ -22,9 +24,9 @@ type Config struct {
 }
 
 type Stats struct {
-	Month string `json:"month"`
-	RX    int64  `json:"rx"`
-	TX    int64  `json:"tx"`
+	Month string  `json:"month"`
+	RX    big.Int `json:"rx"`
+	TX    big.Int `json:"tx"`
 }
 
 type DiscordEmbed struct {
@@ -68,10 +70,10 @@ func readConfig(filename string) (*Config, error) {
 	return &config, nil
 }
 
-func readNetworkBytes(interfaceName string) (int64, int64, error) {
+func readNetworkBytes(interfaceName string) (big.Int, big.Int, error) {
 	data, err := os.ReadFile("/proc/net/dev")
 	if err != nil {
-		return 0, 0, err
+		return big.Int{}, big.Int{}, err
 	}
 
 	lines := strings.Split(string(data), "\n")
@@ -84,19 +86,22 @@ func readNetworkBytes(interfaceName string) (int64, int64, error) {
 
 			rxBytes, err := strconv.ParseInt(parts[1], 10, 64)
 			if err != nil {
-				return 0, 0, err
+				return big.Int{}, big.Int{}, err
 			}
 
 			txBytes, err := strconv.ParseInt(parts[9], 10, 64)
 			if err != nil {
-				return 0, 0, err
+				return big.Int{}, big.Int{}, err
 			}
 
-			return rxBytes, txBytes, nil
+			var rxBig, txBig big.Int
+			rxBig.SetInt64(rxBytes)
+			txBig.SetInt64(txBytes)
+			return rxBig, txBig, nil
 		}
 	}
 
-	return 0, 0, fmt.Errorf("インターフェース %s が見つかりません", interfaceName)
+	return big.Int{}, big.Int{}, fmt.Errorf("インターフェース %s が見つかりません", interfaceName)
 }
 
 func loadStats(statsFile string) (*Stats, bool, error) {
@@ -127,29 +132,32 @@ func saveStats(statsFile string, stats *Stats) error {
 	return os.WriteFile(statsFile, data, 0644)
 }
 
-func formatBytes(nBytes int64) string {
+func formatBytes(Bytes *big.Int) string {
 	units := []string{"B", "KB", "MB", "GB", "TB"}
-	size := float64(nBytes)
-
+	fSize := new(big.Float).SetInt(Bytes)
+	k := big.NewFloat(1024.0)
 	for _, unit := range units {
-		if size < 1024.0 {
-			return fmt.Sprintf("%.2f %s", size, unit)
+		cmp := fSize.Cmp(k)
+		if cmp == -1 {
+			val, _ := fSize.Float64()
+			return fmt.Sprintf("%.2f %s", val, unit)
 		}
-		size /= 1024.0
+		fSize.Quo(fSize, k)
 	}
-
-	return fmt.Sprintf("%.2f PB", size)
+	val, _ := fSize.Float64()
+	return fmt.Sprintf("%.2f PB", val)
 }
 
-func sendToDiscord(interfaceName, rxGB, txGB, totalGB, webhookURL, botName string) error {
+func sendToDiscord(interfaceName, rx, tx, total, webhookURL, botName string) error {
+	month := time.Now().Format("2006年1月")
 	embed := DiscordEmbed{
-		Title:     fmt.Sprintf("%s の通信量（今月）", interfaceName),
+		Title:     fmt.Sprintf("%s の通信量（%s）", interfaceName, month),
 		Color:     0x00bfff,
 		Timestamp: time.Now().UTC().Format(time.RFC3339),
 		Fields: []EmbedField{
-			{Name: "受信", Value: rxGB, Inline: true},
-			{Name: "送信", Value: txGB, Inline: true},
-			{Name: "合計", Value: totalGB, Inline: false},
+			{Name: "受信", Value: rx, Inline: true},
+			{Name: "送信", Value: tx, Inline: true},
+			{Name: "合計", Value: total, Inline: false},
 		},
 	}
 
@@ -184,8 +192,7 @@ func SendMonthlyNetStats() {
 		os.Exit(1)
 	}
 
-	today := time.Now()
-	monthKey := today.Format("2006-01")
+	monthKey := time.Now().Format("2006-01")
 
 	stats, isFirstRun, err := loadStats(config.StatsFile)
 	if err != nil {
@@ -218,9 +225,19 @@ func SendMonthlyNetStats() {
 		return
 	}
 
-	usedRX := currentRX - stats.RX
-	usedTX := currentTX - stats.TX
-	total := usedRX + usedTX
+	usedRX := new(big.Int).Sub(&currentRX, &stats.RX)
+	usedTX := new(big.Int).Sub(&currentTX, &stats.TX)
+
+	if usedRX.Sign() < 0 || usedTX.Sign() < 0 {
+		stats.RX = currentRX
+		stats.TX = currentTX
+		stats.Month = monthKey
+		saveStats(config.StatsFile, stats)
+		slog.Warn("カウントリセットを検出したため、今月の集計をリセットしました")
+		return
+	}
+
+	total := new(big.Int).Add(usedRX, usedTX)
 
 	err = sendToDiscord(
 		config.Interface,
@@ -237,18 +254,19 @@ func SendMonthlyNetStats() {
 }
 
 func main() {
-	loc, _ := time.LoadLocation("Asia/Tokyo")
+	config, err := readConfig("config.json")
+	if err != nil {
+		slog.Error("設定ファイルの読み込みエラー", "error", err)
+		os.Exit(1)
+	}
+
+	loc, _ := time.LoadLocation(config.TimeZone)
 	s, err := gocron.NewScheduler(gocron.WithLocation(loc))
 	if err != nil {
 		slog.Error("スケジューラの作成に失敗", "error", err)
 		os.Exit(1)
 	}
 
-	config, err := readConfig("config.json")
-	if err != nil {
-		slog.Error("設定ファイルの読み込みエラー", "error", err)
-		os.Exit(1)
-	}
 	if _, err := os.Stat(config.StatsFile); os.IsNotExist(err) {
 		SendMonthlyNetStats()
 	}
