@@ -10,6 +10,8 @@ import (
 	"strconv"
 	"strings"
 	"time"
+
+	"github.com/go-co-op/gocron/v2"
 )
 
 type Config struct {
@@ -175,7 +177,7 @@ func sendToDiscord(interfaceName, rxGB, txGB, totalGB, webhookURL, botName strin
 	return nil
 }
 
-func main() {
+func SendMonthlyNetStats() {
 	config, err := readConfig("config.json")
 	if err != nil {
 		slog.Error("設定ファイルの読み込みエラー", "error", err)
@@ -232,4 +234,34 @@ func main() {
 		slog.Error("Discordへの送信エラー", "error", err)
 		os.Exit(1)
 	}
+}
+
+func main() {
+	loc, _ := time.LoadLocation("Asia/Tokyo")
+	s, err := gocron.NewScheduler(gocron.WithLocation(loc))
+	if err != nil {
+		slog.Error("スケジューラの作成に失敗", "error", err)
+		os.Exit(1)
+	}
+
+	config, err := readConfig("config.json")
+	if err != nil {
+		slog.Error("設定ファイルの読み込みエラー", "error", err)
+		os.Exit(1)
+	}
+	if _, err := os.Stat(config.StatsFile); os.IsNotExist(err) {
+		SendMonthlyNetStats()
+	}
+
+	_, err = s.NewJob(
+		gocron.CronJob("0 0 1 * *", false),
+		gocron.NewTask(SendMonthlyNetStats),
+	)
+	if err != nil {
+		slog.Error("ジョブの登録に失敗", "error", err)
+		os.Exit(1)
+	}
+
+	s.Start()
+	select {}
 }
