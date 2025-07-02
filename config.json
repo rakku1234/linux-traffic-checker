@@ -1,0 +1,6 @@
+{
+    "interface": "eth0",
+    "stats_file": "~/.net_usage_tracker.json",
+    "discord_webhook_url": "",
+    "bot_name": "インターネット使用量チェッカー"
+}
